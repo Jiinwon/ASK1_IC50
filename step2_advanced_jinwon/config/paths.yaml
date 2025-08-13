@@ -1,0 +1,9 @@
+raw_dir: ../data
+interim_dir: data/interim
+processed_dir: data/processed
+featurized_dir: data/featurized
+models_dir: models
+experiments_dir: experiments
+submission_dir: submissions
+receptor_pdbqt: ../data/receptor.pdbqt
+ask1_fasta: ../data/ASK1.fasta

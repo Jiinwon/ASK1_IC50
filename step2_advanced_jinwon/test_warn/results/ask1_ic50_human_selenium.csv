@@ -1,0 +1,1 @@
+ID,Smiles,InChIKey,molecule_chembl_id,activity_id,assay_chembl_id,document_chembl_id,assay_type,assay_desc,standard_type,relation,ic50_value_raw,ic50_unit_raw,ic50_value_nM,pIC50,target_organism,assay_tax_id,cell_id,cell_name,data_validity_comment,src,source_url

@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/gpfs/home1/won0316/DACON/JUMP_AI_2025_EST/step2_advanced_jinwon/src/train/train_regression.py", line 42, in <module>
+    from src.models import XGBRegressor, EnsembleModel
+  File "/gpfs/home1/won0316/DACON/JUMP_AI_2025_EST/step2_advanced_jinwon/src/models/__init__.py", line 1, in <module>
+    from .xgb_model import XGBRegressor
+  File "/gpfs/home1/won0316/DACON/JUMP_AI_2025_EST/step2_advanced_jinwon/src/models/xgb_model.py", line 2, in <module>
+    import xgboost as xgb
+ModuleNotFoundError: No module named 'xgboost'

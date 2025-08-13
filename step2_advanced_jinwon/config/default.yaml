@@ -1,0 +1,9 @@
+ecfp_bits: 2048
+ecfp_radius: 2
+ecfp_use_chirality: true
+split: scaffold
+n_splits: 5
+imputer: iterative  # iterative | knn | none
+balanced_loss: true
+score_competition: true
+ood_report: true
