@@ -67,7 +67,7 @@ def submit_job(partition: str) -> str | None:
 
 
 def main() -> None:
-    partitions = [f"gpu{i}" for i in range(1, 7)]
+    partitions = [f"gpu{i}" for i in range(6, 7)]
     for part in partitions:
         print(f"Trying partition {part}...")
         job_id = submit_job(part)

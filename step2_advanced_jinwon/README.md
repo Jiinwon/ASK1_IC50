@@ -9,17 +9,24 @@ four known ASK1 inhibition mechanisms:
 3. **ATP-competitive inhibition through the hinge region**
 4. **SCF Fbxo21 ubiquitin ligase modulation**
 
-The pipeline now follows the data loading procedure from the baseline notebook
-found in `step1_baseline/`. ChEMBL and PubChem data are loaded and merged as in
-the notebook before standardization. Morgan fingerprints, MACCS keys,
-physicochemical descriptors and heuristic mechanism flags are computed. Optionally, docking
-scores (e.g. Gibbs free energy from AutoDock Vina or Schrödinger) can be added
-when the required tools are installed. An XGBoost regressor trains on these
-features and reports a validation RMSE. When `ensemble_size` in
-`config/hyperparams.yaml` is greater than 1, multiple models are bootstrapped and
-averaged to provide a mean prediction with a per-compound standard deviation.
-After training, predictions for `data/test.csv` are saved to
-`submissions/advanced_jinwon_submission.csv`.
+The training script now builds the dataset directly from the raw CAS,
+ChEMBL and PubChem files located in `data/`. For each source the SMILES
+strings and pIC50 values are extracted and merged into a single
+`raw_input.csv`. Canonical SMILES are generated, duplicates are removed
+and the result is saved as `processed_input.csv`. The data is then split
+into `processed_train.csv` and `processed_val.csv` for model training.
+Histograms of all four datasets and of the test-set predictions are
+written to `results/`.
+
+Morgan fingerprints, MACCS keys, physicochemical descriptors and the
+mechanism flags are computed on the processed training data. Optionally,
+docking scores and complex-structure descriptors can be appended when
+the required tools are installed. An XGBoost regressor trains on these
+features and reports a validation RMSE. When `use_complex_features` is
+set in `config/hyperparams.yaml`, simple descriptors summarising ASK1
+protein–protein complex interfaces are included. After training,
+predictions for `data/test.csv` are written to the dated subdirectory
+under `submissions/`.
 A lightweight neural network alternative is available in `src/train/train_mlp_ensemble.py`.
 It trains an ensemble of `MLPRegressor` models and writes predictions to `submission/DATE/submission_TIME.csv`.
 
@@ -33,11 +40,11 @@ It trains an ensemble of `MLPRegressor` models and writes predictions to `submis
    ```
 
 2. Run the training script from the repository root. It can be invoked either
-   directly or with the `-m` flag. The training pipeline now applies a simple
-   SMOTE-based augmentation on the training set to mitigate overfitting.
-   Hyperparameters are tuned via 5-fold cross validation and early
-   stopping with a small validation split so training will halt automatically
-   when the score stops improving:
+   directly or with the `-m` flag. The script automatically loads the raw CAS,
+   ChEMBL and PubChem datasets, imputes missing IC50 values and builds
+   feature caches before training. Hyperparameters are tuned via 5-fold
+   cross validation and early stopping with a small validation split so
+   training halts automatically when the score stops improving:
 
    ```bash
    # Option A: execute directly
@@ -51,6 +58,11 @@ After training, predictions for `data/test.csv` will be written to
 `submissions/advanced_jinwon_submission.csv`.
 To train an MLP ensemble instead, run `src/train/train_mlp_ensemble.py`. Results are placed in `submission/DATE/submission_TIME.csv`.
 
+To activate the complex-structure features, set `use_complex_features: true`
+in `config/hyperparams.yaml` and ensure `complex_structures_dir` in
+`config/paths.yaml` points to the directory containing the ASK1 complex PDB
+files.
+
 
 ## Required Packages
 
@@ -63,6 +75,7 @@ listed in `requirements.txt` and can be installed with `pip install -r requireme
 * lightgbm
 * optuna
 * rdkit
+* biopython
 
 ## Running with SLURM
 

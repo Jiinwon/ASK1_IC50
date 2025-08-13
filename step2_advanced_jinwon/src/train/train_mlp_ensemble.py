@@ -22,6 +22,7 @@ from src.featurization.physchem import add_physchem_features
 from src.featurization.mech_features import add_mechanism_flags
 from src.featurization.docking import add_docking_scores
 from src.featurization.structure import add_structure_features
+from src.featurization.complex_features import add_complex_features
 from src.models import MLPEnsembleModel
 
 
@@ -33,9 +34,24 @@ def main():
         "fsp3",
         "docking_score",
         "af_rmsd",
+        "complex_interaction_residues",
+        "complex_hbond_count",
+        "complex_interface_area",
     ]
     feature_cols = [c for c in feature_cols if c in df.columns]
-    scale_cols = [c for c in ["tpsa", "fsp3", "docking_score", "af_rmsd"] if c in feature_cols]
+    scale_cols = [
+        c
+        for c in [
+            "tpsa",
+            "fsp3",
+            "docking_score",
+            "af_rmsd",
+            "complex_interaction_residues",
+            "complex_hbond_count",
+            "complex_interface_area",
+        ]
+        if c in feature_cols
+    ]
 
     X = df[feature_cols]
     y = df["pIC50"]
@@ -84,6 +100,8 @@ def main():
     test_df = add_mechanism_flags(test_df)
     test_df = add_docking_scores(test_df)
     test_df = add_structure_features(test_df)
+    if CFG.get_hparam("use_complex_features"):
+        test_df = add_complex_features(test_df)
 
     X_test = test_df[feature_cols]
     X_test[scale_cols] = X_test[scale_cols].fillna(0.0)

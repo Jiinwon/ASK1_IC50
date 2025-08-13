@@ -6,32 +6,44 @@ import argparse
 import json
 import logging
 from pathlib import Path
+import sys
 
+# Ensure project root is on ``sys.path`` so imports like ``src`` and ``utils``
+# work when the script is executed directly (``python train_regression.py``).
+project_root = Path(__file__).resolve().parents[2]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from typing import Optional, Callable
+
+import math
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 import pandas as pd
 import scipy.stats
+from scipy.stats import gaussian_kde
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold
+from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, train_test_split
+from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import NearestNeighbors
+try:
+    from imblearn.over_sampling import SMOTER, SMOGN
+except Exception:  # pragma: no cover - imbalanced-learn not installed
+    SMOTER = SMOGN = None  # type: ignore
 
 from src.data.impute import build_feature_pipeline
 from src.data.splitters import compute_scaffolds
 from src.data.standardize_smiles import apply_standardization
-from src.data.impute_ic50 import (
-    load_data,
-    preprocess,
-    impute_missing,
-    save_outputs,
-)
-from src.data.feature_cache import load_or_create
 from src.featurization.ecfp import featurize
 from src.featurization.maccs import add_maccs_features
 from src.featurization.physchem import add_physchem_features
 from src.featurization.mech_features import add_mechanism_flags
 from src.featurization.docking import add_docking_scores
 from src.featurization.structure import add_structure_features
+from src.featurization.complex_features import add_complex_features
 from src.models import XGBRegressor, EnsembleModel
 from src.metrics.competition import nM_from_pIC50, comp_score
 from src.eval.metrics import competition_score
@@ -40,9 +52,6 @@ from utils.scaffold_split import scaffold_kfold
 from utils.seed import set_seed
 
 logger = logging.getLogger(__name__)
-
-if __package__ is None or __package__ == "":
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def load_data(path: Path) -> pd.DataFrame:
@@ -53,63 +62,164 @@ def oversample_extreme(
     X: pd.DataFrame,
     y: pd.Series,
     *,
-    lower: float = 4.5,
-    upper: float = 6.5,
-    target_size: int | str = "max",
+    low_thresh: float = 4.5,
+    mid_thresh: float = 6.5,
+    high_thresh: float = 7.5,
+    target_sizes: Optional[dict] = None,
+    sampler_type: str = "smoter",
 ):
-    """Balance extreme pIC50 regions using SMOGN-style over/under-sampling."""
+    """Balance extreme pIC50 regions using SMOTER/SMOGN."""
 
     X = X.reset_index(drop=True)
     y = y.reset_index(drop=True)
 
-    low_mask = y < lower
-    high_mask = y > upper
-    mid_mask = ~(low_mask | high_mask)
+    low_mask = y < low_thresh
+    mid_mask = (y >= low_thresh) & (y < mid_thresh)
+    high_mask = (y >= mid_thresh) & (y < high_thresh)
+    extra_high_mask = y >= high_thresh
 
-    n_low, n_mid, n_high = low_mask.sum(), mid_mask.sum(), high_mask.sum()
-    if target_size == "max":
-        target = max(n_low, n_mid, n_high)
-    else:
-        target = int(target_size)
+    counts = {
+        "low": int(low_mask.sum()),
+        "mid": int(mid_mask.sum()),
+        "high": int(high_mask.sum()),
+        "extra_high": int(extra_high_mask.sum()),
+    }
+    if target_sizes is None:
+        target_sizes = counts
 
-    try:
-        from imblearn.over_sampling import SMOTER as _SMOTEReg
-    except Exception:  # pragma: no cover - fallback when SMOTER unavailable
-        from imblearn.over_sampling import SMOTEN as _SMOTEReg  # type: ignore
-    from imblearn.under_sampling import RandomUnderSampler
-    from sklearn.utils import resample
+    sampler_cls = SMOGN if sampler_type.lower() == "smogn" else SMOTER
+    if sampler_cls is None:
+        raise ImportError("imbalanced-learn is required for oversample_extreme")
 
-    def _oversample_part(X_part: pd.DataFrame, y_part: pd.Series):
-        if len(X_part) < 2:
+    def _oversample_part(
+        X_part: pd.DataFrame, y_part: pd.Series, target: int
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        if len(X_part) == 0:
             return X_part, y_part
-        sampler = _SMOTEReg(random_state=42)
+        if target <= len(X_part):
+            return X_part.iloc[:target], y_part.iloc[:target]
+        sampler = sampler_cls(random_state=42)
         X_res, y_res = X_part, y_part
         while len(X_res) < target:
             X_res, y_res = sampler.fit_resample(X_res, y_res)
         return X_res.iloc[:target], y_res.iloc[:target]
 
-    X_low_res, y_low_res = _oversample_part(X[low_mask], y[low_mask])
-    X_high_res, y_high_res = _oversample_part(X[high_mask], y[high_mask])
+    X_low_res, y_low_res = _oversample_part(
+        X[low_mask], y[low_mask], int(target_sizes["low"])
+    )
+    X_mid_res, y_mid_res = _oversample_part(
+        X[mid_mask], y[mid_mask], int(target_sizes["mid"])
+    )
+    X_high_res, y_high_res = _oversample_part(
+        X[high_mask], y[high_mask], int(target_sizes["high"])
+    )
+    X_extra_high_res, y_extra_high_res = _oversample_part(
+        X[extra_high_mask], y[extra_high_mask], int(target_sizes["extra_high"])
+    )
 
-    X_mid_res, y_mid_res = X[mid_mask], y[mid_mask]
-    if len(X_mid_res) > target:
-        rus = RandomUnderSampler(sampling_strategy={0: target}, random_state=42)
-        _, _ = rus.fit_resample(X_mid_res, np.zeros(len(X_mid_res)))
-        sel_idx = rus.sample_indices_
-        X_mid_res = X_mid_res.iloc[sel_idx]
-        y_mid_res = y_mid_res.iloc[sel_idx]
-    elif len(X_mid_res) < target and len(X_mid_res) > 0:
-        X_mid_res, y_mid_res = resample(
-            X_mid_res,
-            y_mid_res,
-            replace=True,
-            n_samples=target,
-            random_state=42,
-        )
-
-    X_res = pd.concat([X_low_res, X_mid_res, X_high_res], ignore_index=True)
-    y_res = pd.concat([y_low_res, y_mid_res, y_high_res], ignore_index=True)
+    X_res = pd.concat(
+        [X_low_res, X_mid_res, X_high_res, X_extra_high_res], ignore_index=True
+    )
+    y_res = pd.concat(
+        [y_low_res, y_mid_res, y_high_res, y_extra_high_res], ignore_index=True
+    )
     return X_res.reset_index(drop=True), y_res.reset_index(drop=True)
+
+
+def compute_kde_weights(y: pd.Series, bandwidth: float = 0.2) -> np.ndarray:
+    """
+    라벨 분포의 커널 밀도 추정을 이용해 역밀도 가중치를 계산한다.
+    밀도가 높을수록 가중치는 작고, 밀도가 낮을수록 가중치는 크게 설정된다.
+    bandwidth 값은 가우시안 커널의 대역폭이다.
+    """
+    kde = gaussian_kde(y.values, bw_method=bandwidth)
+    densities = kde(y.values)
+    densities = np.clip(densities, a_min=1e-8, a_max=None)
+    weights = 1.0 / densities
+    weights /= np.mean(weights)
+    return weights
+
+
+def compute_importance_weights(
+    y_train: pd.Series,
+    y_target: pd.Series,
+    bandwidth: float = 0.2,
+) -> np.ndarray:
+    """
+    훈련 분포와 목표 분포(예: raw 데이터 분포) 간의 밀도 비율을 통해 중요도 가중치를 계산한다.
+    y_train: 현재 훈련 세트의 pIC50 값들
+    y_target: 목표 분포(pIC50) 샘플. raw 데이터 전체 pIC50 시리즈를 전달한다.
+    bandwidth: KDE 대역폭.
+    """
+    kde_train = gaussian_kde(y_train.values, bw_method=bandwidth)
+    kde_target = gaussian_kde(y_target.values, bw_method=bandwidth)
+    density_train = kde_train(y_train.values)
+    density_target = kde_target(y_train.values)
+    density_train = np.clip(density_train, a_min=1e-8, a_max=None)
+    density_target = np.clip(density_target, a_min=1e-8, a_max=None)
+    weights = density_target / density_train
+    weights /= np.mean(weights)
+    return weights
+
+
+def load_raw_training_data(raw_dir: Path) -> pd.DataFrame:
+    """Load CAS, ChEMBL and PubChem data and compute pIC50."""
+    cas = pd.read_excel(
+        raw_dir / "CAS_KPBMA_MAP3K5_IC50s.xlsx",
+        sheet_name="MAP3K5 Ligand IC50s",
+        header=1,
+    )[["SMILES", "pX Value"]].rename(columns={"pX Value": "pIC50"})
+    chembl = pd.read_csv(raw_dir / "ChEMBL_ASK1(IC50).csv", sep=";")[[
+        "Smiles",
+        "pChEMBL Value",
+    ]].rename(columns={"Smiles": "SMILES", "pChEMBL Value": "pIC50"})
+    pubchem = pd.read_csv(raw_dir / "Pubchem_ASK1.csv", low_memory=False)[[
+        "SMILES",
+        "Activity_Value",
+    ]]
+    pubchem["pIC50"] = -np.log10(pubchem["Activity_Value"] / 1_000_000)
+    pubchem = pubchem[["SMILES", "pIC50"]]
+    df = pd.concat([cas, chembl, pubchem], ignore_index=True)
+    df = df.dropna(subset=["SMILES", "pIC50"])
+    df["pIC50"] = pd.to_numeric(df["pIC50"], errors="coerce")
+    df = df.dropna(subset=["pIC50"])
+    return df
+
+
+def preprocess_input(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardise SMILES and remove duplicates."""
+    df = df.copy()
+    df["canonical_smiles"] = apply_standardization(df, smiles_col="SMILES")[
+        "canonical_smiles"
+    ]
+    df = df.dropna(subset=["canonical_smiles"]).drop_duplicates(
+        subset="canonical_smiles"
+    )
+    return df
+
+
+def featurize_all(df: pd.DataFrame) -> pd.DataFrame:
+    """Run the full featurisation pipeline on ``df``."""
+    df = featurize(df)
+    df = add_maccs_features(df)
+    df = add_physchem_features(df)
+    df = add_mechanism_flags(df)
+    df = add_docking_scores(df)
+    df = add_structure_features(df)
+    if CFG.get_hparam("use_complex_features"):
+        df = add_complex_features(df)
+    return df
+
+
+def plot_distribution(df: pd.DataFrame, path: Path, column: str = "pIC50") -> None:
+    """Plot a histogram of ``column`` and save to ``path``."""
+    plt.figure()
+    plt.hist(df[column], bins=40)
+    plt.xlabel(column)
+    plt.ylabel("count")
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.close()
 
 
 def tune_xgb_hyperparams(
@@ -214,197 +324,82 @@ def train_and_evaluate(df: pd.DataFrame, args: argparse.Namespace) -> dict:
     return {"folds": metrics}
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, default=Path("data.csv"))
-    parser.add_argument("--split", choices=["random", "scaffold"], default=CFG.get_hparam("split", "scaffold"))
-    parser.add_argument("--n_splits", type=int, default=CFG.get_hparam("n_splits", 5))
-    parser.add_argument("--imputer", choices=["iterative", "knn", "none"], default=CFG.get_hparam("imputer", "iterative"))
-    parser.add_argument("--score_competition", action="store_true")
-    args = parser.parse_args()
-
-    best_params = CFG.get_hparam("xgb_params", {}) or {}
-    if best_params.get("verbose") is True:
-        best_params["verbose"] = False
-
-    # Choose cross-validation splitter
-    if args.split_method == "scaffold" and smiles is not None:
-        groups = compute_scaffolds(smiles)
-        splitter = GroupKFold(n_splits=args.cv_folds)
-        split_iter = splitter.split(X, y, groups)
-    elif args.split_method == "quantile":
-        bins = pd.qcut(y, q=args.n_bins, labels=False, duplicates="drop")
-        splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
-        split_iter = splitter.split(X, bins)
-    else:
-        splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=42)
-        split_iter = splitter.split(X)
-
-    r2_scores, mae_scores, rmse_scores = [], [], []
-    score_list, A_list, B_list = [], [], []
-
-    for fold, (train_idx, val_idx) in enumerate(split_iter, 1):
-        X_tr, X_val = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
-        y_tr, y_val = y.iloc[train_idx].copy(), y.iloc[val_idx].copy()
-
-        if args.oversample_extreme:
-            X_tr, y_tr = oversample_extreme(X_tr, y_tr)
-            X_tr, y_tr = oversample_quantile(X_tr, y_tr)
-            X_tr, y_tr = smote_regression(X_tr, y_tr)
-        elif args.oversample:
-            X_tr, y_tr = oversample_quantile(X_tr, y_tr)
-            X_tr, y_tr = smote_regression(X_tr, y_tr)
-
-        # Standardize selected numeric features
-        for df_split in (X_tr, X_val):
-            df_split[scale_cols] = df_split[scale_cols].fillna(0.0)
-        if scale_cols:
-            from sklearn.preprocessing import StandardScaler
-
-            scaler = StandardScaler()
-            scaler.fit(X_tr[scale_cols])
-            X_tr[scale_cols] = scaler.transform(X_tr[scale_cols])
-            X_val[scale_cols] = scaler.transform(X_val[scale_cols])
-
-        X_tr, y_tr = clean_split(X_tr, y_tr, f"fold{fold} training")
-        X_val, y_val = clean_split(X_val, y_val, f"fold{fold} validation")
-
-        model = XGBRegressor(best_params)
-        model.train(X_tr, y_tr)
-        preds = model.predict(X_val)
-        r2_scores.append(r2_score(y_val, preds))
-        mae_scores.append(mean_absolute_error(y_val, preds))
-        rmse_scores.append(np.sqrt(mean_squared_error(y_val, preds)))
-        score, A, B = competition_score(y_val.values, preds)
-        score_list.append(score)
-        A_list.append(A)
-        B_list.append(B)
-
-    print(
-        f"CV R2   : {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}\n"
-        f"CV MAE  : {np.mean(mae_scores):.4f} ± {np.std(mae_scores):.4f}\n"
-        f"CV RMSE : {np.mean(rmse_scores):.4f} ± {np.std(rmse_scores):.4f}"
-    )
-    print(
-        f"[SCORE] Score={np.mean(score_list):.6f} | A(normRMSE_IC50)={np.mean(A_list):.6f} | B(R2_IC50)={np.mean(B_list):.6f}"
-    )
-
-    # Train final model on the full dataset
-    X_full, y_full = X.copy(), y.copy()
-    if args.oversample_extreme:
-        X_full, y_full = oversample_extreme(X_full, y_full)
-        X_full, y_full = oversample_quantile(X_full, y_full)
-        X_full, y_full = smote_regression(X_full, y_full)
-    elif args.oversample:
-        X_full, y_full = oversample_quantile(X_full, y_full)
-        X_full, y_full = smote_regression(X_full, y_full)
-    if scale_cols:
-        from sklearn.preprocessing import StandardScaler
-
-        scaler = StandardScaler()
-        X_full[scale_cols] = X_full[scale_cols].fillna(0.0)
-        scaler.fit(X_full[scale_cols])
-        X_full[scale_cols] = scaler.transform(X_full[scale_cols])
-    else:
-        scaler = None
-
-    X_full, y_full = clean_split(X_full, y_full, "final training")
-
-    ensemble_size = CFG.get_hparam("ensemble_size") or 1
-    if ensemble_size > 1:
-        model = EnsembleModel(best_params, n_models=ensemble_size)
-    else:
-        model = XGBRegressor(best_params)
-
-    mask = y_full.notna() & ~np.isinf(y_full)
-    X_full, y_full = X_full.loc[mask], y_full.loc[mask]
-    model.train(X_full, y_full)
-
-    # Prepare test set and generate predictions
+def main(args: argparse.Namespace) -> None:
+    """Train the regression model using the new raw-data workflow."""
     raw_dir = Path(CFG.get_path("raw_dir"))
-    test_df = pd.read_csv(raw_dir / "test.csv")
-    smiles_col = "SMILES" if "SMILES" in test_df.columns else "Smiles"
-    test_df = apply_standardization(test_df, smiles_col=smiles_col)
-    test_df = featurize(test_df)
-    test_df = add_maccs_features(test_df)
-    test_df = add_physchem_features(test_df)
-    test_df = add_mechanism_flags(test_df)
-    test_df = add_docking_scores(test_df)
-    test_df = add_structure_features(test_df)
-
-    X_test = test_df.loc[:, feature_cols].copy()
-    if scale_cols and scaler is not None:
-        X_test.loc[:, scale_cols] = X_test.loc[:, scale_cols].fillna(0.0)
-        X_test.loc[:, scale_cols] = scaler.transform(X_test.loc[:, scale_cols])
-    if ensemble_size > 1:
-        test_preds, test_std = model.predict(X_test, return_std=True)
-        test_df["prediction_std"] = test_std
-    else:
-        test_preds = model.predict(X_test)
-
-    # ── 날짜/시각 하위 폴더(서울 기준) 생성 ─────────────────────────────
-    base_dir = Path(CFG.get_path("submission_dir"))
-    now = datetime.now(ZoneInfo("Asia/Seoul"))
-    date_str = now.strftime("%Y%m%d")     # 예: 20250807
-    time_str = now.strftime("%H%M")       # 예: 1135
-    sub_dir = base_dir / date_str / time_str
-    sub_dir.mkdir(parents=True, exist_ok=True)
-    file_ts = now.strftime("%Y%m%d_%H%M%S")
-    submission_path = sub_dir / f"submission_{args.split_method}_{file_ts}.csv"
-    out_df = pd.DataFrame(
-        {"ID": test_df["ID"], "ASK1_IC50_nM": ((10 ** (-test_preds)) * 1e9)}
-    )
-    if ensemble_size > 1:
-        out_df["pred_std"] = test_df["prediction_std"]
-    out_df.to_csv(submission_path, index=False)
-    print(f"Test predictions saved to {submission_path}")
-
-    # ── 테스트 예측 분포 로그 ───────────────────────────────────────────
     results_dir = project_root / "results"
     results_dir.mkdir(exist_ok=True)
-    mean_pred, std_pred = float(np.mean(test_preds)), float(np.std(test_preds))
-    plt.figure()
-    plt.hist(test_preds, bins=40)
-    plt.title(f"pIC50 predictions {mean_pred:.2f}±{std_pred:.2f}")
-    plt.tight_layout()
-    hist_path = results_dir / f"pIC50_pred_hist_{file_ts}.png"
-    plt.savefig(hist_path)
-    plt.close()
-    print(f"Prediction histogram saved to {hist_path}")
+
+    raw_df = load_raw_training_data(raw_dir)
+    raw_df.to_csv(raw_dir / "raw_input.csv", index=False)
+    plot_distribution(raw_df, results_dir / "raw_input.png")
+
+    processed_df = preprocess_input(raw_df)
+    processed_df.to_csv(raw_dir / "processed_input.csv", index=False)
+    plot_distribution(processed_df, results_dir / "processed_input.png")
+
+    train_df, val_df = train_test_split(processed_df, test_size=args.val_size, random_state=42)
+    train_df.to_csv(raw_dir / "processed_train.csv", index=False)
+    val_df.to_csv(raw_dir / "processed_val.csv", index=False)
+    plot_distribution(train_df, results_dir / "processed_train.png")
+    plot_distribution(val_df, results_dir / "processed_val.png")
+
+    train_feats = featurize_all(train_df)
+    val_feats = featurize_all(val_df)
+    feature_cols = [c for c in train_feats.columns if isinstance(c, int)] + ["tpsa","fsp3","docking_score","af_rmsd"]
+    feature_cols = [c for c in feature_cols if c in train_feats.columns]
+    scale_cols = [c for c in ["tpsa","fsp3","docking_score","af_rmsd"] if c in feature_cols]
+    X_tr = train_feats[feature_cols].copy()
+    y_tr = train_feats["pIC50"].copy()
+    X_val = val_feats[feature_cols].copy()
+    y_val = val_feats["pIC50"].copy()
+
+    scaler=None
+    if scale_cols:
+        scaler=StandardScaler()
+        X_tr.loc[:,scale_cols]=X_tr.loc[:,scale_cols].fillna(0.0)
+        X_val.loc[:,scale_cols]=X_val.loc[:,scale_cols].fillna(0.0)
+        X_tr.loc[:,scale_cols]=scaler.fit_transform(X_tr.loc[:,scale_cols])
+        X_val.loc[:,scale_cols]=scaler.transform(X_val.loc[:,scale_cols])
+
+    params=CFG.get_hparam("xgb_params") or {}
+    if params.get("verbose") is True:
+        params["verbose"]=False
+    model=XGBRegressor(params)
+    model.train(X_tr,y_tr)
+    preds_val=model.predict(X_val)
+    rmse=float((mean_squared_error(y_val,preds_val))**0.5)
+    r2=float(r2_score(y_val,preds_val))
+    mae=float(mean_absolute_error(y_val,preds_val))
+    print(f"Validation RMSE: {rmse:.4f}, R2: {r2:.4f}, MAE: {mae:.4f}")
+
+    test_df=pd.read_csv(raw_dir/"test.csv")
+    smiles_col="SMILES" if "SMILES" in test_df.columns else "Smiles"
+    test_df=apply_standardization(test_df,smiles_col=smiles_col)
+    test_feats=featurize_all(test_df)
+    X_test=test_feats.loc[:,feature_cols].copy()
+    if scale_cols and scaler is not None:
+        X_test.loc[:,scale_cols]=X_test.loc[:,scale_cols].fillna(0.0)
+        X_test.loc[:,scale_cols]=scaler.transform(X_test.loc[:,scale_cols])
+    test_preds=model.predict(X_test)
+    test_feats["pIC50_pred"]=test_preds
+    plot_distribution(test_feats.rename(columns={"pIC50_pred":"pIC50"}),results_dir/"test_pred.png")
+
+    base_dir=Path(CFG.get_path("submission_dir"))
+    now=datetime.now(ZoneInfo("Asia/Seoul"))
+    date_str=now.strftime("%Y%m%d")
+    time_str=now.strftime("%H%M")
+    sub_dir=base_dir/date_str/time_str
+    sub_dir.mkdir(parents=True,exist_ok=True)
+    file_ts=now.strftime("%Y%m%d_%H%M%S")
+    submission_path=sub_dir/f"submission_{file_ts}.csv"
+    out_df=pd.DataFrame({"ID":test_feats["ID"],"ASK1_IC50_nM":((10**(-test_preds))*1e9)})
+    out_df.to_csv(submission_path,index=False)
+    print(f"Test predictions saved to {submission_path}")
 
     return model
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train ASK1 IC50 regressor")
-    parser.add_argument(
-        "--split-method",
-        choices=["random", "quantile", "scaffold"],
-        default="quantile",
-        help="How to split data for cross-validation",
-    )
-    parser.add_argument("--cv-folds", type=int, default=5, help="Number of CV folds")
-    parser.add_argument("--n-bins", type=int, default=5, help="Quantile bins for stratification")
-    parser.add_argument(
-        "--min-ic50",
-        type=float,
-        default=None,
-        help="Minimum IC50 value used when converting to pIC50",
-    )
-    parser.add_argument(
-        "--use-log1p",
-        action="store_true",
-        help="Use log1p before log10 in IC50 to pIC50 conversion",
-    )
-    parser.add_argument(
-        "--oversample",
-        action="store_true",
-        help="Enable simple quantile and SMOTE-style oversampling",
-    )
-    parser.add_argument(
-        "--oversample-extreme",
-        action="store_true",
-        help="Balance extreme pIC50 regions before standard oversampling",
-    )
+    parser.add_argument("--val-size", type=float, default=0.2, help="Validation set fraction")
     args = parser.parse_args()
     main(args)

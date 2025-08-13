@@ -6,6 +6,7 @@ from .mech_features import add_mechanism_flags
 from .docking import add_docking_scores
 from .structure import add_structure_features
 from .maccs import add_maccs_features
+from .complex_features import add_complex_features
 
 __all__ = [
     "featurize",
@@ -14,4 +15,5 @@ __all__ = [
     "add_docking_scores",
     "add_structure_features",
     "add_maccs_features",
+    "add_complex_features",
 ]

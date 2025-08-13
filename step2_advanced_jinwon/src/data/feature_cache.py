@@ -12,6 +12,7 @@ from src.featurization.physchem import add_physchem_features
 from src.featurization.mech_features import add_mechanism_flags
 from src.featurization.docking import add_docking_scores
 from src.featurization.structure import add_structure_features
+from src.featurization.complex_features import add_complex_features
 
 
 def _build_features(*, min_ic50: float | None = None, use_log1p: bool = False) -> pd.DataFrame:
@@ -25,6 +26,8 @@ def _build_features(*, min_ic50: float | None = None, use_log1p: bool = False) -
         ("docking", add_docking_scores),
         ("structure", add_structure_features),
     ]
+    if CFG.get_hparam("use_complex_features"):
+        steps.append(("complex", add_complex_features))
     df: pd.DataFrame | None = None
     pbar = tqdm(total=len(steps))
     for i, (desc, fn) in enumerate(steps):

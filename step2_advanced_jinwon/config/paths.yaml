@@ -7,3 +7,4 @@ experiments_dir: experiments
 submission_dir: submissions
 receptor_pdbqt: ../data/receptor.pdbqt
 ask1_fasta: ../data/ASK1.fasta
+complex_structures_dir: ../data/ASK1_structures_20250813

@@ -1,6 +1,7 @@
 ecfp_bits: 2048
 ecfp_radius: 2
 gnn_hidden_dim: 512
-feature_sheet: feature_11
+feature_sheet: feature_12
 include_maccs: true
 ensemble_size: 5
+use_complex_features: false

@@ -8,6 +8,7 @@ from typing import Iterable, Sequence
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer, KNNImputer, MissingIndicator
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, RobustScaler
